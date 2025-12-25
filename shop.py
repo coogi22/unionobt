@@ -1,26 +1,37 @@
 import os
 import discord
-from discord.ext import commands
-from discord import app_commands
+from discord.ext import commands, tasks
+from discord import ui, Interaction
 import aiohttp
 from aiohttp import ClientTimeout
 from datetime import datetime, timezone
-import traceback
 
 from utils.supabase import get_supabase
+from commands.tickets import create_or_get_ticket_channel, CloseTicketView
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-GUILD_ID = 1345153296360542271
-ACCESS_ROLE_ID = 1444450052323147826
+SHOP_CHANNEL_ID = 1444450990970503188
 LOG_CHANNEL_ID = 1449252986911068273
+GUILD_ID = 1345153296360542271
+
+ACCESS_ROLE_ID = 1444450052323147826  # Premium role
+
+STAFF_ROLE_IDS = {
+    1432015464036433970,
+    1449491116822106263,
+}
+
+SHOP_URL = "https://scriptunion.mysellauth.com/"
+BOT_LOGO_URL = "https://cdn.discordapp.com/attachments/1449252986911068273/1449511913317732485/ScriptUnionIcon.png"
+
+EMBED_COLOR = 0x489BF3
 
 SELLAUTH_API_KEY = os.getenv("SELLAUTH_API_KEY")
 SELLAUTH_SHOP_ID = os.getenv("SELLAUTH_SHOP_ID")
 
 supabase = get_supabase()
-
 
 # -----------------------------
 # SELLAUTH HELPERS
@@ -47,138 +58,150 @@ def invoice_is_paid(invoice: dict) -> bool:
     return status in {"completed", "paid"} and not refunded and not cancelled
 
 
+def extract_product_and_variant(invoice: dict) -> tuple[str, str]:
+    items = invoice.get("items")
+    if isinstance(items, list) and items:
+        item = items[0]
+        product = item.get("product", {})
+        variant = item.get("variant", {})
+
+        product_name = product.get("name") or "Unknown"
+        variant_name = variant.get("name") or product_name
+
+        return product_name.strip(), variant_name.strip()
+
+    return "Unknown", "Standard"
+
+
+# -----------------------------
+# MODAL
+# -----------------------------
+class RedeemOrderModal(ui.Modal, title="Redeem Order ID"):
+    order_id = ui.TextInput(
+        label="SellAuth Order / Invoice ID",
+        placeholder="Paste your order/invoice ID here",
+        required=True,
+        max_length=128,
+    )
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: Interaction):
+        invoice_id = self.order_id.value.strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        guild = interaction.guild
+        member = guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
+
+        # Already redeemed?
+        if supabase.table("role_redeem").select("id").eq("invoice_id", invoice_id).execute().data:
+            await interaction.followup.send("This order has already been redeemed.", ephemeral=True)
+            return
+
+        invoice = await fetch_invoice(invoice_id)
+        if not invoice or not invoice_is_paid(invoice):
+            await interaction.followup.send("Order is invalid or unpaid.", ephemeral=True)
+            return
+
+        product_name, variant_name = extract_product_and_variant(invoice)
+
+        role = guild.get_role(ACCESS_ROLE_ID)
+        if role and role not in member.roles:
+            await member.add_roles(role, reason=f"SellAuth redeem {invoice_id}")
+
+        supabase.table("role_redeem").insert({
+            "role_id": ACCESS_ROLE_ID,
+            "redeemed": True,
+            "redeemed_by": member.id,
+            "invoice_id": invoice_id,
+            "product_name": product_name,
+            "variant_name": variant_name,
+            "discord_username": str(member),
+            "redeemed_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        await interaction.followup.send(
+            "✅ Order confirmed. Premium role applied.\n"
+            "Please open a ticket so staff can whitelist you.",
+            ephemeral=True,
+        )
+
+
+# -----------------------------
+# VIEW
+# -----------------------------
+class ShopView(ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+        self.add_item(ui.Button(label="🛒 Purchase", url=SHOP_URL, style=discord.ButtonStyle.link))
+
+    @ui.button(label="✅ Redeem Order ID", style=discord.ButtonStyle.primary)
+    async def redeem_order(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.send_modal(RedeemOrderModal(self.bot))
+
+    @ui.button(label="🎫 Open Ticket", style=discord.ButtonStyle.secondary)
+    async def open_ticket(self, interaction: Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        channel = await create_or_get_ticket_channel(interaction.guild, interaction.user)
+        await interaction.followup.send(f"Ticket ready: {channel.mention}", ephemeral=True)
+
+
 # -----------------------------
 # COG
 # -----------------------------
-class InvoiceRedeem(commands.Cog):
+class Shop(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.refresh_shop.start()
 
-    @app_commands.command(
-        name="redeem",
-        description="Verify a SellAuth order/invoice ID and grant access to a selected user"
-    )
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    # Optional: uncomment to restrict to admins by default
-    @app_commands.default_permissions(administrator=True)
-    async def redeem(
-        self,
-        interaction: discord.Interaction,
-        order_id: str,
-        user: discord.Member
-    ):
-        # Defer immediately so Discord doesn't timeout
-        try:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-        except Exception:
+    @tasks.loop(count=1)
+    async def refresh_shop(self):
+        await self.bot.wait_until_ready()
+        channel = self.bot.get_channel(SHOP_CHANNEL_ID)
+        if not isinstance(channel, discord.TextChannel):
             return
 
-        try:
-            invoice_id = (order_id or "").strip()
+        async for msg in channel.history(limit=10):
+            if msg.author == self.bot.user:
+                await msg.delete()
 
+        embed = discord.Embed(
+            title="Fix-It-Up Premium Script — Shop",
+            description=(
+                f"{SHOP_URL}\n\n"
+                "**How it works:**\n"
+                "1) 🛒 Purchase premium\n"
+                "2) ✅ Redeem Order ID\n"
+                "3) 💎 Receive Premium role\n"
+                "4) 🎫 Open a ticket to get whitelisted"
+            ),
+            color=discord.Color(EMBED_COLOR),
+        )
 
-            # Basic config
-            if not SELLAUTH_API_KEY or not SELLAUTH_SHOP_ID:
-                await interaction.followup.send("SellAuth is not configured yet.", ephemeral=True)
-                return
+        embed.add_field(name="👑 Lifetime", value="**$25 USD**\n**4,000 Robux**", inline=True)
+        embed.add_field(name="📅 Month", value="**$10 USD**\n**1,700 Robux**", inline=True)
+        embed.add_field(name="📅 Week", value="**$5 USD**\n**750 Robux**", inline=True)
 
-            guild = interaction.guild
-            if not guild:
-                await interaction.followup.send("This command must be used in the server.", ephemeral=True)
-                return
+        embed.add_field(
+            name="🎁 Roblox Gift Cards",
+            value=(
+                "Accepted via ticket only\n"
+                "**Must be $5 higher than product price**\n"
+                "Example: $25 product → $30 card"
+            ),
+            inline=False,
+        )
 
-            # Safety: ensure target user is in this guild
-            if user.guild.id != guild.id:
-                await interaction.followup.send("That user is not in this server.", ephemeral=True)
-                return
+        embed.set_author(name="Script Union Shop", icon_url=BOT_LOGO_URL)
+        embed.set_thumbnail(url=BOT_LOGO_URL)
+        embed.set_footer(text="Fix-It-Up Script • Premium Access")
 
-            # 1) Already redeemed?
-            existing = (
-                supabase.table("role_redeem")
-                .select("id")
-                .eq("invoice_id", invoice_id)
-                .execute()
-            )
-            if existing.data:
-                await interaction.followup.send("This order has already been redeemed.", ephemeral=True)
-                return
-
-            # 2) Verify with SellAuth
-            invoice = await fetch_invoice(invoice_id)
-            if not invoice:
-                await interaction.followup.send("Order not found. Double-check the ID and try again.", ephemeral=True)
-                return
-
-            if not invoice_is_paid(invoice):
-                await interaction.followup.send(
-                    "This order is not completed/paid, or it was refunded/cancelled.",
-                    ephemeral=True
-                )
-                return
-
-            product_name = invoice.get("product_name", "Unknown Product")
-            variant_name = invoice.get("variant_name")
-
-            # 3) Give role to the SELECTED user
-            role = guild.get_role(ACCESS_ROLE_ID)
-            if not role:
-                await interaction.followup.send("Access role not found. Contact staff.", ephemeral=True)
-                return
-
-            if role not in user.roles:
-                try:
-                    await user.add_roles(role, reason=f"SellAuth redeem {invoice_id} (issued by {interaction.user.id})")
-                except discord.Forbidden:
-                    await interaction.followup.send(
-                        "I can’t assign roles. Make sure my role is above the access role and I have Manage Roles.",
-                        ephemeral=True
-                    )
-                    return
-
-            # 4) Store redemption (records who redeemed AND who received it)
-            supabase.table("role_redeem").insert({
-                "code": None,
-                "role_id": int(ACCESS_ROLE_ID),
-                "redeemed": True,
-                "redeemed_by": int(interaction.user.id),   # staff who ran /redeem
-                "invoice_id": invoice_id,
-                "product_name": product_name,
-                "variant_name": variant_name,
-                "discord_username": str(user),            # who received access
-                "redeemed_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
-
-            # 5) Log
-            log_channel = guild.get_channel(LOG_CHANNEL_ID)
-            if log_channel is None:
-                try:
-                    log_channel = await guild.fetch_channel(LOG_CHANNEL_ID)
-                except Exception:
-                    log_channel = None
-
-            if log_channel:
-                embed = discord.Embed(title="Order Redeemed", color=discord.Color.orange())
-                embed.add_field(name="Staff", value=f"{interaction.user} ({interaction.user.id})", inline=False)
-                embed.add_field(name="Granted To", value=f"{user} ({user.id})", inline=False)
-                embed.add_field(name="Product", value=product_name, inline=False)
-                embed.add_field(name="Variant", value=variant_name or "N/A", inline=False)
-                embed.add_field(name="Order ID", value=invoice_id, inline=False)
-                await log_channel.send(embed=embed)
-
-            await interaction.followup.send(
-                f"Confirmed order and granted access to {user.mention}.",
-                ephemeral=True
-            )
-
-        except Exception as e:
-            print("ERROR in /redeem:", repr(e))
-            traceback.print_exc()
-            await interaction.followup.send(
-                "Something broke while redeeming. Staff: check bot terminal logs.",
-                ephemeral=True
-            )
+        await channel.send(embed=embed, view=ShopView(self.bot))
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(InvoiceRedeem(bot))
-    print("✅ Loaded cog: invoice_redeem")  
+    await bot.add_cog(Shop(bot))
